@@ -1,0 +1,1 @@
+logstash -e 'input { stdin { } } output { stdout {} }'

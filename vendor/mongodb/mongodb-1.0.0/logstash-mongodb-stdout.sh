@@ -1,0 +1,1 @@
+/Applications/logstash-1.4.0/bin/logstash -f mongodb-stdout.conf
