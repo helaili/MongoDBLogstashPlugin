@@ -32,7 +32,6 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
   public
   def register
     require 'mongo'
-    @logger.info("Registering MongoDB, mongoClientecting to #{@uri}")
     @uriParsed=Mongo::URIParser.new(@uri)
     setReadPreference
   end # def register
@@ -40,7 +39,7 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
   private
   def connect
-    @logger.warn("Connecting to MongoDB at #{@uri}")
+    @logger.warn("Connecting to MongoDB at #{@uriParsed.node_strings}")
   	@mongoClient = @uriParsed.connection({})
     
     
@@ -179,7 +178,6 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
   private
   def syncSharded(host, output_queue) 
-    @logger.warn("xxxxxxxxxxxx #{host} xxxxxxxxxxxx")
     mongoLocalClient = Mongo::URIParser.new(host).connection({})
     db = mongoLocalClient.db()
     coll = db.collection("oplog.rs", :read => @read_preference)
