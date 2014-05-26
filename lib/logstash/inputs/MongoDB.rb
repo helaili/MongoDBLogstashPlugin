@@ -21,13 +21,21 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
   config :collection, :validate => :string, :required => true
 
   # What kind of data do we want
-  config :sync_mode, :validate => [ "full", "new", "stored" ], :required => true
+  config :sync_mode, :validate => [ "full", "stored", "force" ], :required => true
 
   # Read preference?
   config :read, :validate => [ "primary", "primary_preferred", "secondary", "secondary_preferred", "nearest" ], :default => "primary"
 
-  # Read preference?
-  config :auth_db, :validate => :string, :default => "admin"
+  # How often should we save the oplog read point
+  config :oplog_sync_flush_inteval, :validate => :number, :default => 10
+
+  # Where to save the oplog read point
+  config :oplog_sync_file, :validate => :string, :default => "oplogSync.json"
+
+  # Max retry before exiting on connection failure. Use -1 for never
+  config :max_retry, :validate => :number, :default => 10
+
+
 
   public
   def register
@@ -41,7 +49,6 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
   def connect
     @logger.warn("Connecting to MongoDB at #{@uriParsed.node_strings}")
   	@mongoClient = @uriParsed.connection({})
-    
     
     return @mongoClient.db()
   end # def connect
@@ -97,30 +104,28 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
 
   private 
-  def readOplog(coll, output_queue)
-    if !@ts.nil?
-      @logger.warn(@ts)
+  def readOplog(host, coll, output_queue)
+    
+    query = {'fromMigrate' => {'$exists' => false}}
+    
+    if !@oplogSyncPoint[host].nil? && !@sync_mode.eql?("force") 
+      ts = BSON::Timestamp.new(@oplogSyncPoint[host]['seconds'], @oplogSyncPoint[host]['increment'])
+      query['ts'] = {'$gt' => ts}
     end
-        
-    #cursor = Mongo::Cursor.new(coll, :tailable => true, :order => [['$natural', 1]])
-    if @collection.eql?("*") # We want all the collections of this DB
-      if @ts.nil?
-        cursor = coll.find({'fromMigrate' => {'$exists' => false}}, :hint => '$natural')
-      else
-        cursor = coll.find({'fromMigrate' => {'$exists' => false}, ts: {'$gte' => @ts}}, :hint => '$natural')
-      end
-    else
-      if @ts.nil?
-        cursor = coll.find({'fromMigrate' => {'$exists' => false}, 'ns' => "#{@db_name}.#{@collection}"}, :hint => '$natural')
-      else 
-        cursor = coll.find({'fromMigrate' => {'$exists' => false}, 'ns' => "#{@db_name}.#{@collection}", ts: {'$gte' => @ts}}, :hint => '$natural')
-      end
-    end
+    
+    if !@collection.eql?("*")
+      query['ns'] = "#{@db_name}.#{@collection}"
+    end      
+    
+    @logger.debug("Using query #{query} for oplog at #{host}")
+
+    cursor = coll.find(query, :hint => '$natural')
     cursor.add_option(Mongo::Constants::OP_QUERY_TAILABLE)
 
     loop do
       if doc = cursor.next_document
-        @ts = doc['ts']
+        @oplogSyncPoint[host] = {'seconds' => doc['ts'].seconds, 'increment' => doc['ts'].increment}
+        @retryCounter = 0
         output_queue << doc
       else
         sleep 1
@@ -131,24 +136,36 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
   private 
   def sync(output_queue)
+    if File.exist?(@oplog_sync_file)
+      File.open( @oplog_sync_file, "r" ) do |f|
+        @oplogSyncPoint = JSON.load(f)
+        f.close
+      end
+    else
+      @logger.info("Oplog sync file #{@oplog_sync_file} does not exist.")
+      @oplogSyncPoint = {}
+    end
+
+
+    #Creating a new thread which will record every 'oplog_sync_flush_inteval' seconds the last operation read for each replicaset
+    oplogSync = Thread.new {
+      while true
+        sleep @oplog_sync_flush_inteval
+        
+        File.open( @oplog_sync_file, "w" ) do |f|
+          JSON.dump(@oplogSyncPoint, f)
+          f.close
+        end
+      end  
+    }
+
+
     if @mongoClient.mongos? #This is a sharded cluster
       threads = []
       threadCounter = 0
 
       configDb = @mongoClient.db("config") # Need to check the config DB 
 
-      authOn = false
-      username = nil
-      password = nil
-      authSource = nil
-        
-
-      @uriParsed.auths.each do |auth|
-        username = auth[:username]
-        password = auth[:password]
-        authSource = auth[:source]
-        authOn = true
-      end
       
       configDb.collection("shards").find.each do |shardDoc|
         threads[threadCounter] = Thread.new { 
@@ -156,36 +173,47 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
           seedList = shardDoc["host"].match(/\/(.*)/)[1]
           @logger.info("Connecting to oplog using mongodb://#{seedList}/local")
           
-          @ts = nil
-          
-          #if authOn
-          #  syncSharded("mongodb://#{username}:#{password}@#{seedList}/local?authSource=#{authSource}", output_queue) 
-          #else 
-          #  syncSharded("mongodb://#{seedList}/local", output_queue) 
-          #end
+          @retryCounter = 0
           syncSharded("mongodb://#{seedList}/local", output_queue) 
 
         } # Parrallelized the job
         threadCounter += 1  
       end
 
+      
       threads.each {|t| t.join} # Wait for all threads to be finished  
     else # Not a sharded cluster 
-      @ts = nil
       syncNonSharded(output_queue) 
     end
   end # def sync
 
   private
   def syncSharded(host, output_queue) 
-    mongoLocalClient = Mongo::URIParser.new(host).connection({})
-    db = mongoLocalClient.db()
-    coll = db.collection("oplog.rs", :read => @read_preference)
+    coll = nil
+
     begin
-      readOplog(coll, output_queue) 
-    rescue
-      @logger.warn("Connection to MongoDB had a problem. Reconnecting")
-      syncSharded(host, output_queue) 
+      mongoLocalClient = Mongo::URIParser.new(host).connection({})
+      db = mongoLocalClient.db()
+      coll = db.collection("oplog.rs", :read => @read_preference)
+    rescue => e
+      @logger.error("Can't connect to oplog")
+      raise e
+    end
+
+    begin
+      readOplog(host, coll, output_queue) 
+    rescue Mongo::ConnectionFailure
+      if @max_retry >= 0 && @retryCounter >= @max_retry
+        @logger.error("Max retry attempt reached limit of #{@max_retry}. Exiting now")
+        exit
+      else
+        @retryCounter += 1
+        @logger.warn("Connection to MongoDB had a problem. Attempt #{@retryCounter} in 10 seconds")
+        sleep 10
+        syncSharded(host, output_queue) 
+      end
+    rescue => e 
+      @logger.error(e)
     end
   end
 
@@ -194,7 +222,7 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
     localDb = @mongoClient.db("local")
     coll = localDb.collection("oplog.rs", :read => @read_preference)
     begin
-      readOplog(coll, output_queue) 
+      readOplog(@uriParsed.node_strings, coll, output_queue) 
     rescue
       @logger.warn("Connection to MongoDB had a problem. Reconnecting")
       syncNonSharded(output_queue) 
@@ -211,6 +239,14 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
   
       if @sync_mode.eql?("full") || @sync_mode.eql?("stored") #We need to read the data already stored in the DB
+        if File.exist?(@oplog_sync_file)
+          @logger.warn("Oplog sync file #{@oplog_sync_file} was found. Use sync mode 'force' to resync completly.")
+        else
+          readStoredData(output_queue)
+        end
+      end
+
+      if @sync_mode.eql?("force")  #We need to read the data already stored in the DB and discard oplog sync file
         readStoredData(output_queue)
       end
 
