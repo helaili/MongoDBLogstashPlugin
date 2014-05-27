@@ -126,7 +126,8 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
       if doc = cursor.next_document
         @oplogSyncPoint[host] = {'seconds' => doc['ts'].seconds, 'increment' => doc['ts'].increment}
         @retryCounter = 0
-        output_queue << doc
+        doc['o']['ns'] = doc['ns']
+        output_queue << doc['o']
       else
         sleep 1
       end
@@ -168,19 +169,17 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
 
       
       configDb.collection("shards").find.each do |shardDoc|
-        threads[threadCounter] = Thread.new { 
-          # Transforms "shard0/xxx:27100,yyy:27101,zzz:27102" in "mongodb://xxx:27100,yyy:27101,zzz:27102/local"
-          seedList = shardDoc["host"].match(/\/(.*)/)[1]
+        threads[threadCounter] = Thread.new { # Create a new thread per shard
+          seedList = shardDoc["host"].match(/\/(.*)/)[1] # Transforms "shard0/xxx:27100,yyy:27101,zzz:27102" in "mongodb://xxx:27100,yyy:27101,zzz:27102/local"
           @logger.info("Connecting to oplog using mongodb://#{seedList}/local")
           
           @retryCounter = 0
           syncSharded("mongodb://#{seedList}/local", output_queue) 
 
-        } # Parrallelized the job
+        } 
         threadCounter += 1  
       end
 
-      
       threads.each {|t| t.join} # Wait for all threads to be finished  
     else # Not a sharded cluster 
       syncNonSharded(output_queue) 
@@ -214,6 +213,7 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
       end
     rescue => e 
       @logger.error(e)
+      exit
     end
   end
 
@@ -223,9 +223,19 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
     coll = localDb.collection("oplog.rs", :read => @read_preference)
     begin
       readOplog(@uriParsed.node_strings, coll, output_queue) 
-    rescue
-      @logger.warn("Connection to MongoDB had a problem. Reconnecting")
-      syncNonSharded(output_queue) 
+    rescue Mongo::ConnectionFailure
+      if @max_retry >= 0 && @retryCounter >= @max_retry
+        @logger.error("Max retry attempt reached limit of #{@max_retry}. Exiting now")
+        exit
+      else
+        @retryCounter += 1
+        @logger.warn("Connection to MongoDB had a problem. Attempt #{@retryCounter} in 10 seconds")
+        sleep 10
+        syncNonSharded(output_queue) 
+      end
+    rescue => e 
+      @logger.error(e)
+      exit
     end
   end
 
@@ -256,8 +266,8 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
         sync(output_queue)
       end
     rescue => e # MongoDB error
-      @logger.warn("Failed to get data from MongoDB", :exception => e, :backtrace => e.backtrace)
-      raise e
+      @logger.error("Failed to get data from MongoDB", :exception => e, :backtrace => e.backtrace)
+      exit
     end
   end # def run
 
