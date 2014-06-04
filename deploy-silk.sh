@@ -1,1 +1,0 @@
-tar xfv MongoDBLogstashPlugin-1.0.0.tar -C /Applications/SiLK-1.1/solrWriterForLogStash/logstash_deploy

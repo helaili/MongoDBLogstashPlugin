@@ -12,6 +12,10 @@ Installation instructions
 Download and untar MongoDBLogstashPlugin-1.0.0.tar in the root directory of your logstash installation. If you're planning on using SiLK-1.1, do not use its bundle logstash version but rather download a fresh install from the web. 
 
 
+Parameters
+=========================
+
+
 Integration with SiLK-1.1
 =========================
 You need a vanilla logstash, not the one that ships with SiLk. Nevertheless, you need to deploy Lucidworks' code to this vanilla install. 
@@ -40,5 +44,28 @@ Well... you know..
 Run
 =========================
 Have a look at the '.conf' and '.sh' files in <MongoDBLogstashPlugin repo>/vendor/mongodb/MongoDBLogstashPlugin-1.0.0
+
+
+Parameters
+=========================
+:uri ==> type string, default is "mongodb://localhost:27017/test". It's the URI of your MongoDB server or replica set.
+
+:collection ==> type string, required. The name of the mongodb collection
+
+:sync_mode ==> one of [ "full", "stored", "force" ], requiered. 
+	- full = normal behavior, get the existing data+oplog with memory of where we stopped in case of crash (uses :oplog_sync_flush_inteval and :oplog_sync_file)
+	- stored = ignore the oplog
+	- force = existing data+oplog regardless of the content of :oplog_sync_file
+
+:oplog_sync_flush_inteval ==> number, default is 10. How often in sec should we save the oplog read point
+
+:oplog_sync_file ==> string, default is "oplogSync.json". Where to save the oplog read point
+
+:read ==> one of [ "primary", "primary_preferred", "secondary", "secondary_preferred", "nearest" ], default value is "primary". Where to read from
+
+:max_retry ==> number, default is 10. Max retry before exiting on connection failure. Use -1 for never
+
+:output_format ==> one of [ "plain", "event"], default is "event". Do we want to wrap the data in a logstash event objet or not. Useful for filters
+
 
 

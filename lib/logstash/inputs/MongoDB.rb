@@ -3,6 +3,7 @@
 require "logstash/inputs/base"
 require "logstash/inputs/threadable"
 require "logstash/namespace"
+require "logstash/MongoDBEvent"
 
 #
 # This input plugin will read data from a user collection in a MongoDB database and/or listen to updates in the oplog
@@ -35,6 +36,8 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
   # Max retry before exiting on connection failure. Use -1 for never
   config :max_retry, :validate => :number, :default => 10
 
+  # Do we want to wrap the data in a logstash event objet or not
+  config :output_format, :validate => [ "plain", "event"], :default => "event"
 
 
   public
@@ -78,9 +81,18 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
     
     
     collection.find.each do
-      |row|
-      row["ns"] = namespace
-      output_queue << row
+      |doc|
+      doc["ns"] = namespace
+      doc["op"] = "i"
+
+      if @output_format.eql?("event")
+        event = LogStash::MongoDBEvent.new("message" => doc)
+        event.append(doc)
+        decorate(event)  
+        output_queue << event
+      else
+        output_queue << doc
+      end
     end
   end # def readCollection
 
@@ -126,8 +138,20 @@ class LogStash::Inputs::MongoDB < LogStash::Inputs::Threadable
       if doc = cursor.next_document
         @oplogSyncPoint[host] = {'seconds' => doc['ts'].seconds, 'increment' => doc['ts'].increment}
         @retryCounter = 0
+          
+        
         doc['o']['ns'] = doc['ns']
-        output_queue << doc['o']
+        doc['o']['op'] = doc['op']
+        
+
+        if @output_format.eql?("event")
+          event = LogStash::Event.new("message" => doc['o'])
+          event.append(doc['o'])
+          decorate(event)
+          output_queue << event
+        else
+          output_queue << doc['o']
+        end
       else
         sleep 1
       end
